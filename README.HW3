@@ -1,0 +1,256 @@
+hw3: Linux kernel-based system to support per-process system call vectors
+
+In this assignment, we have modified the Linux kernel to support system calls
+on a per-process basis. Each process can now execute different versions of a
+system call based on the system call vector it is assigned.
+
+Assumptions:
+- support for per-process system call vectors only on x64
+
+Design:
+
+syscall_vector_info structure contains all information related to a system
+call vector.
+Following fields are included in syscall_vector_info:
+- Name of syscall vector (used as description of the vector)
+- ID (Unique identifier of the vector)
+- owner module (required by loadable syscall vectors)
+- Number of processes using this vector
+- spinlock (to consistently update number of processes field)
+- syscall table (array of function pointers)
+- pointer to next syscall_vector_info (to maintain list of syscall vectors)
+
+To bind a process to a syscall vector, task_struct includes a pointer to
+syscall_vector_info structure.
+
+We maintain the list of system call vectors in mainline kernel. We have
+statically defined the following to support this list:
+- syscall_vector_info struct for the default syscall vector (ID = 0)
+  (We do not duplicate the x64 sys_call_table, the default vector refers to
+   the x64 sys_call_table)
+- list of syscall vectors initialized to vector 0
+- rwlock to protect the list of syscall vectors
+
+We had to modify the assembly code to execute syscalls based on the syscall
+vector a process is assigned to. Every syscall now goes through the slow path
+where the process's vector is looked up and the corresponding syscall defined
+in the vector gets called.
+
+A new flag CLONE_SYSCALLS is added to clone(2). If the flag is set, the child
+process inherits the parent's syscall vector else is assigned the default
+syscall vector.
+
+When a process is created, we check whether the CLONE_SYSCALLS flag is set.
+Since existing calls to clone/fork do not use this new flag, all processes
+created at boot time will be assigned default vector 0.
+
+When a process is assigned a vector, we do the following:
+- acquire read lock on the list of syscall vectors
+- find the syscall vector with given ID
+  (this scans the list of syscall vectors and returns location/address of vector
+   if found, else returns the location where a new vector can be inserted)
+- if found, get reference to the module defining the syscall vector (required
+  for loadable modules, this increments the usage count of that module and
+  prevents it from unloading)
+- using spinlock defined in the vector, update number of processes using this
+  vector
+- release read lock
+
+Since the process struct contains syscall_vector_info *, once a process is
+assigned a system call vector, further system calls made by the
+process do not involve any locking or scanning the list of syscall vectors.
+The syscall table defined in the process's vector is directly accessed and
+indexed using the syscall number to execute the system call.
+
+When a process terminates, we do the following:
+- using spinlock defined in the process's vector, decrement the number of
+  processes using this vector
+- if the process was assigned a loadable syscall vector, put the reference
+  on the module defining this vector (the module can be unloaded only when no
+  process is using this vector)
+- set process's syscall vector to NULL
+
+To change the vector of a running process, we do the following:
+- find task_struct using given pid (process ID)
+- get syscall vector for given vid (vector ID)
+  (this increments number of processes using the vector and gets reference
+   on the vector in case of loadable module)
+- decrement number of processes using the old vector and put its reference
+- set process's vector to new vector
+
+New syscall vectors can be added using modules. We define 2 syscall
+vector modules to illustrate this.
+
+To register a new syscall vector, we do the following:
+- acquire write lock on the list of syscall vectors
+- find the syscall vector with ID of vector to be registered
+  (this scans the list of syscall vectors and returns location/address of vector
+   if found, else returns the location where the new vector can be inserted)
+- if the syscall vector was found, a vector with given ID already exists,
+  return -EBUSY,
+  else add the vector at the returned location
+- release write lock
+
+To unregister a syscall vector, we do the following:
+- acquire write lock on the list of syscall vectors
+- search for the vector to be removed in the list of syscall vectors
+- if found, update pointer to reflect deletion of vector, release write lock
+  and return success
+- else, release write lock, return -EINVAL
+
+We define 2 syscall vectors - syscall_vector1 and syscall_vector2.
+syscall_vector1 overrides open, read, write, close, and clone system calls.
+Rest of the system calls are unmodified.
+syscall_vector2 overrides chmod, mkdir, rmdir, link, and unlink system calls.
+Rest of the system calls are unmodified.
+
+Each vector stores the entire system call table. Our modified syscalls may
+call the original syscalls. syscalls (sys_* functions) cannot be called from
+a module since they are not exported. We therefore get the default syscall
+table (array of function pointers) and modify function pointers to point to our
+overridden syscalls. We save the original function pointers (used by our
+overridden syscalls) before modifying the syscall table.
+
+Functionality of overridden syscalls:
+We log the syscall and the user who issued the system call. This can be used
+to understand the operations performed by a user and if the user turns out to
+be a malicious one, we can block the user from executing any system call.
+For open, read, write, close and clone, we do not allow any user except root
+to execute these system calls.
+chmod does not allow OTHERS execute permission.
+mkdir does not allow pathname to contain ".". Prevents creation of hidden
+directories.
+rmdir does not allow removal of directories containing "important" in their
+pathnames.
+link does not allow creation of hardlinks to files containing "tmp" in their
+names.
+unlink does not allow a process containing "virus" in its name to execute
+unlink system call.
+
+clone2:
+We define a new system call clone2 which does the following:
+- if CLONE_SYSCALLS is set, child process inherits parent's syscall vector
+- if CLONE_SYSCALLS is not set, child process is assigned the syscall vector
+  having vector ID passed as last argument to clone2 (if the vector ID is
+  valid, clone2 will fail for invalid vector ID).
+clone2 has the same arguments as clone(2) with one additional argument - vector id.
+	asmlinkage long sys_clone2(unsigned long, unsigned long, int __user *,
+		int __user *, unsigned long, u8);
+
+We define ioctls to support following through user programs:
+- obtain list of syscall vectors
+- obtain syscall vector ID of a process
+- change syscall vector of a process
+
+We create another module syscalldev to handle these ioctls. This module
+registers a char device /dev/syscalldev on which the user program invokes
+these ioctls.
+
+We do not expose the entire syscall_vector_info struct to user space. Instead
+we define a new structure (syscall_vector) to contain all information
+required by user space. This structure contains following:
+- name of syscall vector
+- ID of syscall vector
+- Number of processes using the vector
+
+User space program: svctl
+To obtain list of syscall vectors:
+# ./svctl
+The user space program allocates array of MAX_VECTOR_LEN syscall_vector to
+obtain the list of vectors.
+
+To get vector ID of a process:
+#./svctl -p <pid>
+
+To change vector ID of a process:
+#./svctl -p <pid> -v <vid>
+
+For further usage details:
+#./svctl -h
+
+Files included in this submission:
+
+Mainline kernel files modified:
+
+arch/x86/entry/entry_64.S
+	Modified execution path of syscalls to go through slow path
+
+arch/x86/entry/common.c
+	Defined a new function sys_call_dispatch which finds syscall vector of
+	current process and calls the system call using vector's syscall table
+
+include/linux/sched.h
+	Modified struct task_struct to include syscall_vector_info *
+
+include/uapi/linux/sched.h
+	Added new clone flag CLONE_SYSCALLS
+
+kernel/fork.c
+	Modified _do_fork function to check CLONE_SYSCALLS flag. If flag is
+	set, child process inherits parent's vector else child process is
+	assigned default vector 0.
+	Defined new syscall clone2.
+
+kernel/exit.c
+	Modified do_exit function to call exit_syscall_vector to decrement
+	reference count of vector when a process terminates.
+
+arch/x86/entry/Makefile
+	Modified to include file syscall_vector.c
+
+arch/x86/entry/syscalls/syscall_64.tbl
+include/linux/syscalls.h
+	Modified to add new syscall clone2
+
+New files:
+
+arch/x86/include/asm/syscall_vector.h
+	Contains definition of syscall_vector_info struct and declarations of
+	functions used in kernel space to support per-process syscall vector
+	system.
+
+arch/x86/entry/syscall_vector.c
+	Contains definitions of default syscall vector, linked list of syscall
+	vectors, and helper functions to find a syscall vector by ID, get a
+	syscall vector (incrementing its reference), get syscall vector of
+	current process, increment number of processes using a given vector,
+	decrement number of processes using a given vector and put its
+	reference, fill user space struct, exit syscall vector.
+	Provides following exported functions which are used by modules:
+	register_syscall_vector
+	unregister_syscall_vector
+	get_default_syscall_table
+	update_syscall_vector_by_pid
+	list_syscall_vectors
+
+include/linux/sys_vec.h
+	Contains definitions shared between user space and kernel
+	(syscall_vector and MAX_VECTOR_LEN).
+
+hw3/:
+
+svctl.c
+	User space program that calls ioctls
+
+syscalldev.h
+	Contains ioctl definitions and ioctl argument definition
+
+syscalldev.c
+	Module handling ioctls
+
+syscall_vector1.c
+	Module defining syscall vector 1. Contains definitions of overridden
+	syscalls, syscall vector 1.
+
+syscall_vector2.c
+	Module defining syscall vector 2. Contains definitions of overridden
+	syscalls, syscall vector 2.
+
+Makefile
+	Builds all modules and user space program
+
+install_module.sh
+	Script used during testing to install all new modules
+
+test/
+	Contains programs for testing hw3 functionality
